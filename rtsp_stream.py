@@ -26,10 +26,10 @@ REMOTE_RTSP_PORT = "8554"
 REMOTE_RTSP_PATH = "/fire"   # đổi path nếu cần, ví dụ: "/live/camera1"
 REMOTE_RTSP_URL  = f"rtsp://{REMOTE_RTSP_HOST}:{REMOTE_RTSP_PORT}{REMOTE_RTSP_PATH}"
 
-WIDTH, HEIGHT = 320, 240
+WIDTH, HEIGHT = 640, 480
 FPS           = 20
 CONF_THRESH   = 0.5
-IMGSZ         = 240
+IMGSZ         = 320
 NAMES         = {0: "fire", 1: "smoke"}
 # ─────────────────────────────────────────────────────
 
@@ -244,9 +244,9 @@ class CaptureThread(Thread):
             print(f"🔥 Fire detected! Count: {self.fire_count}")
             if self.fire_count >= 100:
                 print("⚠️  Fire count threshold reached, activating GPIO!")
-                control_gpio.control_buzzer(True)
                 if not self.published:
-                    mqtt_function.publish_fire_detected(1,0.8,mqtt.client)
+                    mqtt.publish_detected_fire_warning(2, float(detections[0][4]))
+                    control_gpio.control_buzzer(True)
                     self.published = True
         else:
             if self.fire_count > 0 and current_time - self.last_fire_time > 3:

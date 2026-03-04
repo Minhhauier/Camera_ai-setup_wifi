@@ -16,7 +16,7 @@ This project implements a smart camera system using a Raspberry Pi, which detect
         + sudo apt update
         + sudo apt install python3-dbus
         + sudo apt install python3-gi gir1.2-glib-2.0
-        + sudo apt install opencv-python
+        + pip install opencv-python
         + sudo apt install python3-numpy
         + pip install tflite-runtime
         + pip install paho-mqtt

@@ -55,6 +55,7 @@ def main():
 
     ensure_wifi()
     threading.Thread(target=control_gpio.gpio_function, daemon=True).start()
+    threading.Thread(target=mqtt.main, daemon=True).start()
     # threading.Thread(target=esp32.temp_gas, daemon=True).start()
     print("Starting RTSP stream...")
     rtsp_stream.main()
