@@ -92,55 +92,85 @@ class CaptureThread(Thread):
             self.model_in_h  = IMGSZ
         print("Model loaded OK!")
 
+    # def run(self):
+    #     cmd = [
+    #         "rpicam-vid",
+    #         "--width",     str(WIDTH),
+    #         "--height",    str(HEIGHT),
+    #         "--framerate", str(FPS),
+    #         "--codec",     "mjpeg",
+    #         "--output",    "-",
+    #         "--timeout",   "0",
+    #         "--nopreview",
+    #         "--flush",
+    #     ]
+
+    #     print("Khởi động rpicam-vid (mjpeg)...")
+    #     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+    #                             stderr=subprocess.DEVNULL, bufsize=0)
+    #     print("Camera OK, bắt đầu inference...")
+
+    #     buf = b""
+    #     while self.running:
+    #         chunk = proc.stdout.read(65536)
+    #         if not chunk:
+    #             time.sleep(0.01)
+    #             continue
+    #         buf += chunk
+
+    #         last_start = buf.rfind(b'\xff\xd8')
+    #         last_end   = buf.rfind(b'\xff\xd9')
+
+    #         if last_start != -1 and last_end != -1 and last_end > last_start:
+    #             jpg = buf[last_start:last_end + 2]
+    #             buf = buf[last_end + 2:]
+
+    #             frame = cv2.imdecode(np.frombuffer(jpg, dtype=np.uint8), cv2.IMREAD_COLOR)
+    #             if frame is None:
+    #                 continue
+
+    #             self._frame_count += 1
+    #             if self._frame_count % 3 == 0:
+    #                 frame = self._detect(frame)
+    #                 self._last_frame = frame
+    #             elif self._last_frame is not None:
+    #                 frame = self._last_frame
+
+    #             self.buffer.write(frame)
+
+    #     proc.terminate()
+    #     proc.wait()
     def run(self):
-        cmd = [
-            "rpicam-vid",
-            "--width",     str(WIDTH),
-            "--height",    str(HEIGHT),
-            "--framerate", str(FPS),
-            "--codec",     "mjpeg",
-            "--output",    "-",
-            "--timeout",   "0",
-            "--nopreview",
-            "--flush",
-        ]
+        print("Khởi động webcam (cv2.VideoCapture)...")
+        
+        cap = cv2.VideoCapture(1)  # 0 = webcam đầu tiên, đổi thành 1, 2... nếu có nhiều cam
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, WIDTH)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, HEIGHT)
+        cap.set(cv2.CAP_PROP_FPS, FPS)
 
-        print("Khởi động rpicam-vid (mjpeg)...")
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                                stderr=subprocess.DEVNULL, bufsize=0)
-        print("Camera OK, bắt đầu inference...")
+        if not cap.isOpened():
+            print("❌ Không mở được webcam!")
+            return
 
-        buf = b""
+        print("Webcam OK, bắt đầu inference...")
+
         while self.running:
-            chunk = proc.stdout.read(65536)
-            if not chunk:
-                time.sleep(0.01)
+            ret, frame = cap.read()
+            if not ret or frame is None:
+                print("⚠️ Không đọc được frame, thử lại...")
+                time.sleep(0.05)
                 continue
-            buf += chunk
 
-            last_start = buf.rfind(b'\xff\xd8')
-            last_end   = buf.rfind(b'\xff\xd9')
+            self._frame_count += 1
+            if self._frame_count % 3 == 0:
+                frame = self._detect(frame)
+                self._last_frame = frame
+            elif self._last_frame is not None:
+                frame = self._last_frame
 
-            if last_start != -1 and last_end != -1 and last_end > last_start:
-                jpg = buf[last_start:last_end + 2]
-                buf = buf[last_end + 2:]
+            self.buffer.write(frame)
 
-                frame = cv2.imdecode(np.frombuffer(jpg, dtype=np.uint8), cv2.IMREAD_COLOR)
-                if frame is None:
-                    continue
-
-                self._frame_count += 1
-                if self._frame_count % 3 == 0:
-                    frame = self._detect(frame)
-                    self._last_frame = frame
-                elif self._last_frame is not None:
-                    frame = self._last_frame
-
-                self.buffer.write(frame)
-
-        proc.terminate()
-        proc.wait()
-
+        cap.release()
     def _preprocess(self, frame):
         target_w = getattr(self, 'model_in_w', IMGSZ)
         target_h = getattr(self, 'model_in_h', IMGSZ)
@@ -425,11 +455,45 @@ def _do_restart():
 
 threading.Thread(target=_do_restart, daemon=True).start()
 
+def start_stream():
+    """Bắt đầu push stream lên RTSP server. Camera/detection vẫn chạy bình thường."""
+    global _streamer, _buffer  # cần expose _buffer ra global trong main()
+
+    if _streamer is not None and _streamer.is_alive():
+        print("⚠️  Stream đang chạy rồi, không cần start lại.")
+        return
+
+    if _buffer is None:
+        print("❌ Buffer chưa sẵn sàng, hãy chắc chắn camera đã khởi động.")
+        return
+
+    print("▶ Bắt đầu stream lên RTSP...")
+    _streamer = StreamPushThread(_buffer)
+    _streamer.start()
+    print(f"✅ Stream started → {REMOTE_RTSP_URL}")
+
+
+def stop_stream():
+    """Dừng push stream lên RTSP server. Camera và fire detection KHÔNG bị ảnh hưởng."""
+    global _streamer
+
+    if _streamer is None or not _streamer.is_alive():
+        print("⚠️  Stream không chạy, không cần stop.")
+        return
+
+    print("⏹ Dừng stream...")
+    _streamer.stop()
+    _streamer.join(timeout=5)
+    _streamer = None
+    print("✅ Stream stopped. Camera vẫn đang detect fire bình thường.")
+_streamer: StreamPushThread = None
+_buffer: FrameBuffer = None   
 def main():
-    global _streamer 
+    global _streamer, _buffer
     Gst.init(None)
 
     buffer  = FrameBuffer()
+    _buffer = buffer
     capture = CaptureThread(buffer)
     capture.start()
 
@@ -443,9 +507,10 @@ def main():
         time.sleep(0.1)
 
     print(f"\n✓ Camera OK! Bắt đầu push lên {REMOTE_RTSP_URL}")
-    streamer = StreamPushThread(buffer)
-    _streamer = streamer
-    streamer.start()
+    # streamer = StreamPushThread(buffer)
+    # _streamer = streamer
+    # streamer.start()
+    start_stream()
 
     print(f"\n📡 Để xem stream, dùng:")
     print(f"   VLC: vlc {REMOTE_RTSP_URL} --network-caching=500")

@@ -6,6 +6,7 @@ from connect_esp32 import temp_gas
 import mqtt_function
 import subprocess
 import control_gpio
+import rtsp_stream
 
 
 MQTT_BROKER = "broker.chtlab.us"
@@ -39,6 +40,12 @@ def on_message(client, userdata, msg):
             mqtt_function.publish_response(200,0,client)
         elif payload.get("command_type") == 201:
             print("BE request stream video")
+            if(payload.get("data").get("action") == 1):
+                print("Starting video stream")
+                rtsp_stream.start_stream()
+            elif(payload.get("data").get("action") == 0):
+                print("Stopping video stream")
+                rtsp_stream.stop_stream()
             mqtt_function.publish_response(201,3,client)
         elif payload.get("command_type") == 202:
             print("BE control camera")
