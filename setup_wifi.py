@@ -9,6 +9,7 @@ import json
 import time
 
 import mqtt_function as function
+import control_gpio
 
 BLUEZ_SERVICE_NAME = "org.bluez"
 GATT_MANAGER_IFACE = "org.bluez.GattManager1"
@@ -22,6 +23,48 @@ LOCAL_NAME   = "WIFI_SETUP_" + function.serial_number
 
 # ✅ Gọi 1 lần duy nhất
 dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
+
+
+def wifi_link_connected(expected_ssid=None):
+    """Return True when Wi-Fi link is connected (does not require internet)."""
+    try:
+        result = subprocess.run(
+            ["nmcli", "-t", "-f", "DEVICE,TYPE,STATE,CONNECTION", "device", "status"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode != 0:
+            return False
+
+        for line in result.stdout.splitlines():
+            # Format: DEVICE:TYPE:STATE:CONNECTION
+            parts = line.strip().split(":")
+            if len(parts) < 4:
+                continue
+
+            _, dev_type, state, connection = parts[0], parts[1], parts[2], parts[3]
+            if dev_type == "wifi" and state == "connected":
+                if expected_ssid is None:
+                    return True
+                if connection == expected_ssid:
+                    return True
+        return False
+    except Exception as e:
+        print("wifi_link_connected error:", e)
+        return False
+
+
+def set_adapter_provisioning_state(enabled):
+    try:
+        bus = dbus.SystemBus()
+        adapter = bus.get_object(BLUEZ_SERVICE_NAME, "/org/bluez/hci0")
+        props = dbus.Interface(adapter, DBUS_PROP_IFACE)
+        props.Set("org.bluez.Adapter1", "Discoverable", dbus.Boolean(enabled))
+        props.Set("org.bluez.Adapter1", "Pairable", dbus.Boolean(enabled))
+        print(f"Adapter provisioning state set: enabled={enabled}")
+    except Exception as e:
+        print("set_adapter_provisioning_state error:", e)
 
 
 class DBusObject(dbus.service.Object):
@@ -140,7 +183,7 @@ class Characteristic(DBusObject):
                     f.write(ssid)
                 print(f"Wi-Fi connected, wrote sentinel {sentinel}")
 
-                # ✅ Restart stream sau 3s
+                #  Restart stream sau 3s
                 def do_restart():
                     time.sleep(3)
                     try:
@@ -151,12 +194,23 @@ class Characteristic(DBusObject):
 
                 threading.Thread(target=do_restart, daemon=True).start()
 
-                # Stop BLE loop
+                # Stop BLE loop when Wi-Fi link is really up (no internet check required)
                 try:
                     if MAIN_LOOP is not None:
-                        GLib.idle_add(MAIN_LOOP.quit)
-                except Exception:
-                    pass
+                        connected = False
+                        for _ in range(20):
+                            if wifi_link_connected(expected_ssid=ssid) or wifi_link_connected():
+                                connected = True
+                                break
+                            time.sleep(1)
+
+                        if connected:
+                            print("Stopping BLE provisioning loop (Wi-Fi link connected)...")
+                            GLib.idle_add(stop_provisioning)
+                        else:
+                            print("Wi-Fi link still not connected after nmcli; keeping BLE running")
+                except Exception as e:
+                    print("Error while deciding BLE stop:", e)
             else:
                 print("nmcli non-zero return code; connection may have failed")
 
@@ -208,13 +262,18 @@ _ble_app     = None
 _ble_adv     = None
 _ble_svc     = None
 _ble_char    = None
+_ble_bus     = None
+_ble_service_manager = None
+_ble_ad_manager = None
 _ble_running = False
 _ble_counter = 0
 # ──────────────────────────────────────────────
 
 def start_provisioning(background=True):
-    global MAIN_LOOP, _ble_app, _ble_adv, _ble_svc, _ble_char, _ble_running, _ble_counter
-
+    global MAIN_LOOP, _ble_app, _ble_adv, _ble_svc, _ble_char
+    global _ble_bus, _ble_service_manager, _ble_ad_manager
+    global _ble_running, _ble_counter
+    control_gpio.control_led(True)  # Bật LED khi bắt đầu provisioning
     if _ble_running:
         print("BLE already running, stopping first...")
         stop_provisioning()
@@ -226,6 +285,12 @@ def start_provisioning(background=True):
     adapter         = bus.get_object(BLUEZ_SERVICE_NAME, "/org/bluez/hci0")
     service_manager = dbus.Interface(adapter, GATT_MANAGER_IFACE)
     ad_manager      = dbus.Interface(adapter, LE_ADVERTISING_MANAGER_IFACE)
+
+    _ble_bus = bus
+    _ble_service_manager = service_manager
+    _ble_ad_manager = ad_manager
+
+    set_adapter_provisioning_state(True)
 
     app  = Application(bus, _ble_counter)
     svc  = Service(bus, _ble_counter, SERVICE_UUID)
@@ -262,9 +327,26 @@ def start_provisioning(background=True):
 
 
 def stop_provisioning():
-    global MAIN_LOOP, _ble_app, _ble_adv, _ble_svc, _ble_char, _ble_running
+    global MAIN_LOOP, _ble_app, _ble_adv, _ble_svc, _ble_char
+    global _ble_bus, _ble_service_manager, _ble_ad_manager
+    global _ble_running
 
     _ble_running = False
+
+    # Important: tell BlueZ to stop advertising and unregister GATT app.
+    if _ble_ad_manager is not None and _ble_adv is not None:
+        try:
+            _ble_ad_manager.UnregisterAdvertisement(_ble_adv.get_path())
+            print("Advertisement unregistered")
+        except Exception as e:
+            print("UnregisterAdvertisement error:", e)
+
+    if _ble_service_manager is not None and _ble_app is not None:
+        try:
+            _ble_service_manager.UnregisterApplication(_ble_app.get_path())
+            print("GATT application unregistered")
+        except Exception as e:
+            print("UnregisterApplication error:", e)
 
     for obj in [_ble_char, _ble_svc, _ble_adv, _ble_app]:
         if obj is not None:
@@ -273,7 +355,13 @@ def stop_provisioning():
             except Exception as e:
                 print(f"remove {type(obj).__name__} error:", e)
 
+    control_gpio.control_led(False)  # Tắt LED khi dừng provisioning
+
     _ble_app = _ble_adv = _ble_svc = _ble_char = None
+    _ble_ad_manager = _ble_service_manager = _ble_bus = None
+
+    # Make adapter non-discoverable/non-pairable after provisioning finishes.
+    set_adapter_provisioning_state(False)
 
     if MAIN_LOOP is not None:
         try:
@@ -281,6 +369,8 @@ def stop_provisioning():
         except Exception:
             pass
         MAIN_LOOP = None
+
+    print("BLE provisioning stopped completely")
 
 
 def setup_wifi():

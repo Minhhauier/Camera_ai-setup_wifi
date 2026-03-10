@@ -5,6 +5,7 @@ import time
 
 # Khởi tạo 1 lần (KHÔNG setup mỗi lần gọi)
 buzzer = Buzzer(14)
+led = Buzzer(16)  # Dùng Buzzer làm LED đơn giản
 button = Button(18, pull_up=True)
 
 def control_buzzer(state):
@@ -12,6 +13,12 @@ def control_buzzer(state):
         buzzer.on()
     else:
         buzzer.off()
+        
+def control_led(state):
+    if state:
+        led.on()
+    else:
+        led.off()
 
 def gpio_function():
     try:

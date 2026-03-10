@@ -13,6 +13,7 @@ MQTT_BROKER = "broker.chtlab.us"
 topic = "SUCAM_" + mqtt_function.serial_number
 _client = None
 
+
 def get_client():
     global _client
     if _client is None:

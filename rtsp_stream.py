@@ -7,6 +7,7 @@ import time
 import subprocess
 import os
 import threading
+import signal
 
 
 import control_gpio
@@ -272,7 +273,7 @@ class CaptureThread(Thread):
             self.fire_count += 1
             self.last_fire_time = current_time
             print(f"🔥 Fire detected! Count: {self.fire_count}")
-            if self.fire_count >= 100:
+            if self.fire_count >= 50:
                 print("⚠️  Fire count threshold reached, activating GPIO!")
                 if not self.published:
                     mqtt.publish_detected_fire_warning(2, float(detections[0][4]))
@@ -368,15 +369,21 @@ class StreamPushThread(Thread):
             if frame.shape[1] != WIDTH or frame.shape[0] != HEIGHT:
                 frame = cv2.resize(frame, (WIDTH, HEIGHT))
 
-            with self._lock:  # ✅ lock khi write
-                try:
-                    if self.proc and self.proc.poll() is None:
-                        self.proc.stdin.write(frame.tobytes())
-                        self.proc.stdin.flush()
-                except (BrokenPipeError, OSError):
-                    print("[ffmpeg] pipe broken, restarting...")
-                    # _start_ffmpeg sẽ được gọi ở vòng lặp tiếp theo
-                    self.proc = None
+            # Do not hold lock while writing/flushing to ffmpeg because this can
+            # block during network switch and prevent stop()/restart() from acquiring the lock.
+            with self._lock:
+                proc = self.proc
+
+            try:
+                if proc and proc.poll() is None:
+                    proc.stdin.write(frame.tobytes())
+                    proc.stdin.flush()
+            except (BrokenPipeError, OSError):
+                print("[ffmpeg] pipe broken, restarting...")
+                # _start_ffmpeg sẽ được gọi ở vòng lặp tiếp theo
+                with self._lock:
+                    if self.proc is proc:
+                        self.proc = None
 
             elapsed = time.time() - t0
             sleep = interval - elapsed
@@ -385,14 +392,27 @@ class StreamPushThread(Thread):
 
     def stop(self):
         self.running = False
+        proc = None
         with self._lock:
-            if self.proc:
+            proc = self.proc
+            self.proc = None
+
+        if proc:
+            try:
+                if proc.stdin:
+                    proc.stdin.close()
+            except Exception:
+                pass
+
+            try:
+                proc.terminate()
+                proc.wait(timeout=3)
+            except Exception:
                 try:
-                    self.proc.stdin.close()
-                except Exception:
-                    pass
-                self.proc.terminate()
-                self.proc.wait()
+                    proc.kill()
+                    proc.wait(timeout=2)
+                except Exception as e:
+                    print("[streamer.stop] force-kill ffmpeg error:", e)
     def _drain_stderr(self, proc):
         try:
             for line in proc.stderr:
@@ -417,43 +437,79 @@ class StreamPushThread(Thread):
     
 
 _streamer: StreamPushThread = None
+_buffer: FrameBuffer = None
+_restart_lock = threading.Lock()
+
+
+def _wait_for_remote_network(host: str, port: int = 8554, timeout: int = 30) -> bool:
+    import socket
+
+    print(f"[restart_stream] waiting for network {host}:{port}...")
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            with socket.create_connection((host, port), timeout=2):
+                print(f"[restart_stream] network reachable: {host}:{port}")
+                return True
+        except (OSError, socket.timeout):
+            time.sleep(2)
+    print(f"[restart_stream] network unreachable after {timeout}s")
+    return False
+
 
 def restart_stream():
     """Gọi từ setup_wifi sau khi đổi WiFi xong."""
-    global _streamer
-    
-    # ✅ Debug: in trạng thái _streamer
-    print(f"[restart_stream] _streamer={_streamer}, alive={_streamer.is_alive() if _streamer else 'N/A'}")
-    
-    if _streamer is None or not _streamer.is_alive():
-        print("⚠️  Streamer not running, cannot restart")
-        return
+    def _do_restart():
+        global _streamer
 
-    print("🔄 Killing old ffmpeg proc...")
-    with _streamer._lock:
-        if _streamer.proc is not None:
+        with _restart_lock:
+            print(
+                f"[restart_stream] _streamer={_streamer}, "
+                f"alive={_streamer.is_alive() if _streamer else 'N/A'}"
+            )
+
+            ok = _wait_for_remote_network(
+                REMOTE_RTSP_HOST, int(REMOTE_RTSP_PORT), timeout=45
+            )
+            if not ok:
+                print("[restart_stream] skip restart because network is not ready")
+                return
+
+            if _buffer is None:
+                print("[restart_stream] buffer not ready, cannot restart stream")
+                return
+
+            if _streamer is None or not _streamer.is_alive():
+                print("[restart_stream] streamer not alive, starting new streamer...")
+                _streamer = StreamPushThread(_buffer)
+                _streamer.start()
+                print(f"[restart_stream] stream restarted -> {REMOTE_RTSP_URL}")
+                return
+
+            # Robust path: keep streaming thread, only rotate ffmpeg process.
+            print("[restart_stream] rotating ffmpeg process...")
+            proc = None
             try:
-                _streamer.proc.stdin.close()
-            except Exception:
-                pass
-            try:
-                _streamer.proc.terminate()
-            except Exception:
-                pass
-            _streamer.proc = None
-        else:
-            print("[restart_stream] proc was already None")
+                with _streamer._lock:
+                    proc = _streamer.proc
+                    _streamer.proc = None
 
-    # ✅ Chạy wait + restart trong thread riêng, không block BLE callback
-def _do_restart():
-    print(f"[restart_stream] waiting for network {REMOTE_RTSP_HOST}:{REMOTE_RTSP_PORT}...")
-    ok = _streamer._wait_for_network(REMOTE_RTSP_HOST, int(REMOTE_RTSP_PORT), timeout=30)
-    if ok:
-        print("✅ Network ready, ffmpeg will restart via run() loop")
-    else:
-        print("❌ Network not ready after 30s")
+                if proc is not None:
+                    # Non-blocking termination: never wait here to avoid deadlock on Wi-Fi switch.
+                    try:
+                        os.kill(proc.pid, signal.SIGKILL)
+                        print(f"[restart_stream] old ffmpeg killed pid={proc.pid}")
+                    except ProcessLookupError:
+                        print("[restart_stream] old ffmpeg already exited")
+                    except Exception as e:
+                        print("[restart_stream] old ffmpeg kill error:", e)
 
-threading.Thread(target=_do_restart, daemon=True).start()
+                print(f"[restart_stream] ffmpeg rotation requested -> {REMOTE_RTSP_URL}")
+                print("[restart_stream] streamer loop will auto-spawn new ffmpeg")
+            except Exception as e:
+                print("[restart_stream] rotate ffmpeg error:", e)
+
+    threading.Thread(target=_do_restart, daemon=True).start()
 
 def start_stream():
     """Bắt đầu push stream lên RTSP server. Camera/detection vẫn chạy bình thường."""
@@ -482,12 +538,19 @@ def stop_stream():
         return
 
     print("⏹ Dừng stream...")
-    _streamer.stop()
-    _streamer.join(timeout=5)
+    try:
+        _streamer.stop()
+        _streamer.join(timeout=5)
+    except Exception as e:
+        print("[stop_stream] stop error:", e)
+
+    if _streamer.is_alive():
+        print("[stop_stream] warning: streamer still alive after timeout")
+
     _streamer = None
     print("✅ Stream stopped. Camera vẫn đang detect fire bình thường.")
-_streamer: StreamPushThread = None
-_buffer: FrameBuffer = None   
+
+
 def main():
     global _streamer, _buffer
     Gst.init(None)

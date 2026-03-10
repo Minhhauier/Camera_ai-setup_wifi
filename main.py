@@ -2,17 +2,18 @@ import os
 import time
 import subprocess
 
-from setup_wifi import start_provisioning
+import setup_wifi 
 import rtsp_stream   # file RTSP của bạn
 import mqtt
 
 import control_gpio
 import threading
 import connect_esp32 as esp32
+
 SENTINEL = "/home/pi/.wifi_configured"
 
 
-def wifi_connected():
+def wifi_connected(internet_test=False):
     for host in ["8.8.8.8", "1.1.1.1", "google.com"]:
         try:
             result = subprocess.run(
@@ -20,10 +21,13 @@ def wifi_connected():
                 capture_output=True
             )
             if result.returncode == 0:
+                internet_test=True
                 return True
         except Exception:
             continue
+    internet_test=False
     return False
+
 
 def ensure_wifi():
     connected = False
@@ -33,7 +37,7 @@ def ensure_wifi():
             return
 
         print("WiFi not connected → starting BLE provisioning")
-        start_provisioning(background=False)  
+        setup_wifi.start_provisioning(background=False)  
         # block tới khi MAIN_LOOP.quit()
 
         print("BLE stopped. Checking WiFi again...")
@@ -62,7 +66,5 @@ def main():
     # print("RTSP stream stopped. Restarting...")
     # rtsp_stream.main()
     
-
-
 if __name__ == "__main__":
     main()
